@@ -28,7 +28,6 @@ ENV HTTP_HOST=0.0.0.0 \
     STORAGE_ROOT=/data/mailbox
 
 EXPOSE 8765
-VOLUME ["/data"]
 
 # Create non-root user and set ownership on data dir
 RUN adduser --disabled-password --gecos "" --uid 10001 appuser && \
