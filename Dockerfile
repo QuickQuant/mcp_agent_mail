@@ -78,7 +78,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    HTTP_HOST=0.0.0.0 \
+    STORAGE_ROOT=/data/mailbox
 ENV PATH="/opt/mcp-agent-mail/.venv/bin:$PATH"
 
 # Set working directory
@@ -89,7 +91,8 @@ COPY --from=build /opt/mcp-agent-mail /opt/mcp-agent-mail
 
 # Create non-root user and set ownership
 RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /opt/mcp-agent-mail
+    mkdir -p /data/mailbox && \
+    chown -R appuser:appuser /opt/mcp-agent-mail /data
 
 # Switch to non-root user
 USER appuser
@@ -97,5 +100,5 @@ USER appuser
 # Expose port
 EXPOSE 8765
 
-# Run the application
-CMD ["uvicorn", "mcp_agent_mail.http:build_http_app", "--factory", "--host", "0.0.0.0", "--port", "8765"]
+# Run the application using the CLI, which constructs settings and the MCP server
+CMD ["python", "-m", "mcp_agent_mail.cli", "serve-http"]
