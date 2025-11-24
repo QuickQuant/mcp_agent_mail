@@ -101,4 +101,5 @@ USER appuser
 EXPOSE 8765
 
 # Run the application using the CLI, which constructs settings and the MCP server
-CMD ["python", "-m", "mcp_agent_mail.cli", "serve-http"]
+# Explicitly bind to all interfaces and the expected port so Railway can reach it
+CMD ["python", "-m", "mcp_agent_mail.cli", "serve-http", "--host", "0.0.0.0", "--port", "8765"]
