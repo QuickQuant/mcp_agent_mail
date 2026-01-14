@@ -38,7 +38,7 @@ from sqlalchemy.orm import aliased
 
 from . import rich_logger
 from .config import Settings, get_settings
-from .db import ensure_schema, get_session, init_engine
+from .db import ensure_schema, get_search_query_multi_project, get_search_query_single_project, get_session, init_engine, is_sqlite_database
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
 from .models import (
@@ -4711,23 +4711,29 @@ def build_mcp_server() -> FastMCP:
 
         Tips
         ----
-        - SQLite FTS5 syntax supported: phrases ("build plan"), prefix (mig*), boolean (plan AND users)
-        - Results are ordered by bm25 score (best matches first)
+        - SQLite: FTS5 syntax supported - phrases ("build plan"), prefix (mig*), boolean (plan AND users)
+        - PostgreSQL: Plain text search - queries are converted to tsquery automatically
+        - Results are ordered by relevance score (best matches first)
         - Limit defaults to 20; raise for broad queries
 
-        Query examples
-        ---------------
+        Query examples (SQLite)
+        -----------------------
         - Phrase search: `"build plan"`
         - Prefix: `migrat*`
         - Boolean: `plan AND users`
         - Require urgent: `urgent AND deployment`
+
+        Query examples (PostgreSQL)
+        ---------------------------
+        - Simple search: `build plan` (matches documents with both words)
+        - Multiple terms: `urgent deployment`
 
         Parameters
         ----------
         project_key : str
             Project identifier.
         query : str
-            FTS5 query string.
+            Search query string (syntax depends on database backend).
         limit : int
             Max results to return.
 
@@ -4768,18 +4774,7 @@ def build_mcp_server() -> FastMCP:
         await ensure_schema()
         async with get_session() as session:
             result = await session.execute(
-                text(
-                    """
-                    SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                           m.thread_id, a.name AS sender_name
-                    FROM fts_messages
-                    JOIN messages m ON fts_messages.rowid = m.id
-                    JOIN agents a ON m.sender_id = a.id
-                    WHERE m.project_id = :project_id AND fts_messages MATCH :query
-                    ORDER BY bm25(fts_messages) ASC
-                    LIMIT :limit
-                    """
-                ),
+                text(get_search_query_single_project()),
                 {"project_id": project.id, "query": query, "limit": limit},
             )
             rows = result.mappings().all()
@@ -5951,22 +5946,18 @@ def build_mcp_server() -> FastMCP:
                 proj_ids = [int(row[0]) for row in proj_ids_rows.fetchall()]
                 if not proj_ids:
                     return []
-                # FTS search limited to projects in proj_ids
-                result = await session.execute(
-                    text(
-                        """
-                        SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                               m.thread_id, a.name AS sender_name, m.project_id
-                        FROM fts_messages
-                        JOIN messages m ON fts_messages.rowid = m.id
-                        JOIN agents a ON m.sender_id = a.id
-                        WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
-                        ORDER BY bm25(fts_messages) ASC
-                        LIMIT :limit
-                        """
-                    ).bindparams(bindparam("proj_ids", expanding=True)),
-                    {"proj_ids": proj_ids, "query": query, "limit": limit},
-                )
+                # FTS search limited to projects in proj_ids (database-specific query)
+                if is_sqlite_database():
+                    result = await session.execute(
+                        text(get_search_query_multi_project()).bindparams(bindparam("proj_ids", expanding=True)),
+                        {"proj_ids": proj_ids, "query": query, "limit": limit},
+                    )
+                else:
+                    # PostgreSQL uses ANY() with array parameter
+                    result = await session.execute(
+                        text(get_search_query_multi_project()),
+                        {"proj_ids": proj_ids, "query": query, "limit": limit},
+                    )
                 rows = result.mappings().all()
             items = [
                 {

@@ -202,7 +202,8 @@ async def ensure_schema(settings: Settings | None = None) -> None:
     - create_all() creates tables that don't exist yet
     - For schema changes: delete the DB and regenerate (dev) or use Alembic (prod)
 
-    Also enables SQLite WAL mode for better concurrent access.
+    Also enables SQLite WAL mode for better concurrent access (SQLite only).
+    PostgreSQL uses its native full-text search capabilities instead of FTS5.
     """
     global _schema_ready, _schema_lock
     if _schema_ready:
@@ -212,14 +213,19 @@ async def ensure_schema(settings: Settings | None = None) -> None:
     async with _schema_lock:
         if _schema_ready:
             return
-        init_engine(settings)
+        resolved_settings = settings or get_settings()
+        init_engine(resolved_settings)
         engine = get_engine()
+        is_sqlite = "sqlite" in resolved_settings.database.url.lower()
         async with engine.begin() as conn:
             # Pure SQLModel: create tables from metadata
-            # (WAL mode is set automatically via event listener in _build_engine)
+            # (WAL mode is set automatically via event listener in _build_engine for SQLite)
             await conn.run_sync(SQLModel.metadata.create_all)
-            # Setup FTS and custom indexes
-            await conn.run_sync(_setup_fts)
+            # Setup FTS and custom indexes (database-specific)
+            if is_sqlite:
+                await conn.run_sync(_setup_fts_sqlite)
+            else:
+                await conn.run_sync(_setup_fts_postgres)
         _schema_ready = True
 
 
@@ -232,7 +238,8 @@ def reset_database_state() -> None:
     _schema_lock = None
 
 
-def _setup_fts(connection) -> None:
+def _setup_fts_sqlite(connection) -> None:
+    """Setup SQLite FTS5 full-text search and indexes."""
     connection.exec_driver_sql(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(message_id UNINDEXED, subject, body)"
     )
@@ -267,6 +274,64 @@ def _setup_fts(connection) -> None:
         """
     )
     # Additional performance indexes for common access patterns
+    _setup_common_indexes(connection)
+
+
+def _setup_fts_postgres(connection) -> None:
+    """Setup PostgreSQL full-text search using tsvector and GIN indexes."""
+    # Add tsvector column for full-text search if it doesn't exist
+    connection.exec_driver_sql(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'messages' AND column_name = 'search_vector'
+            ) THEN
+                ALTER TABLE messages ADD COLUMN search_vector tsvector;
+            END IF;
+        END $$;
+        """
+    )
+    # Create GIN index for fast full-text search
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS idx_messages_search_vector ON messages USING GIN(search_vector)"
+    )
+    # Create trigger function to update search_vector
+    connection.exec_driver_sql(
+        """
+        CREATE OR REPLACE FUNCTION messages_search_vector_update() RETURNS trigger AS $$
+        BEGIN
+            NEW.search_vector := to_tsvector('english', COALESCE(NEW.subject, '') || ' ' || COALESCE(NEW.body_md, ''));
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    # Create trigger (drop first to allow recreation)
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS messages_search_vector_trigger ON messages"
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER messages_search_vector_trigger
+        BEFORE INSERT OR UPDATE ON messages
+        FOR EACH ROW EXECUTE FUNCTION messages_search_vector_update();
+        """
+    )
+    # Update existing rows
+    connection.exec_driver_sql(
+        """
+        UPDATE messages SET search_vector = to_tsvector('english', COALESCE(subject, '') || ' ' || COALESCE(body_md, ''))
+        WHERE search_vector IS NULL;
+        """
+    )
+    # Additional performance indexes for common access patterns
+    _setup_common_indexes(connection)
+
+
+def _setup_common_indexes(connection) -> None:
+    """Setup indexes common to both SQLite and PostgreSQL."""
     connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts)"
     )
@@ -288,4 +353,71 @@ def _setup_fts(connection) -> None:
     connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS idx_message_recipients_agent ON message_recipients(agent_id)"
     )
+
+
+def is_sqlite_database() -> bool:
+    """Check if the current database is SQLite."""
+    settings = get_settings()
+    return "sqlite" in settings.database.url.lower()
+
+
+def get_search_query_single_project() -> str:
+    """Get the appropriate full-text search query for single project search.
+
+    Returns SQLite FTS5 or PostgreSQL tsvector query depending on database.
+    """
+    if is_sqlite_database():
+        return """
+            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                   m.thread_id, a.name AS sender_name
+            FROM fts_messages
+            JOIN messages m ON fts_messages.rowid = m.id
+            JOIN agents a ON m.sender_id = a.id
+            WHERE m.project_id = :project_id AND fts_messages MATCH :query
+            ORDER BY bm25(fts_messages) ASC
+            LIMIT :limit
+        """
+    else:
+        # PostgreSQL: convert query to tsquery format and use tsvector
+        return """
+            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                   m.thread_id, a.name AS sender_name
+            FROM messages m
+            JOIN agents a ON m.sender_id = a.id
+            WHERE m.project_id = :project_id
+              AND m.search_vector @@ plainto_tsquery('english', :query)
+            ORDER BY ts_rank(m.search_vector, plainto_tsquery('english', :query)) DESC
+            LIMIT :limit
+        """
+
+
+def get_search_query_multi_project() -> str:
+    """Get the appropriate full-text search query for multi-project search.
+
+    Returns SQLite FTS5 or PostgreSQL tsvector query depending on database.
+    Note: For PostgreSQL, uses ANY() for project_id IN clause.
+    """
+    if is_sqlite_database():
+        return """
+            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                   m.thread_id, a.name AS sender_name, m.project_id
+            FROM fts_messages
+            JOIN messages m ON fts_messages.rowid = m.id
+            JOIN agents a ON m.sender_id = a.id
+            WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
+            ORDER BY bm25(fts_messages) ASC
+            LIMIT :limit
+        """
+    else:
+        # PostgreSQL: use ANY() for array parameter
+        return """
+            SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                   m.thread_id, a.name AS sender_name, m.project_id
+            FROM messages m
+            JOIN agents a ON m.sender_id = a.id
+            WHERE m.project_id = ANY(:proj_ids)
+              AND m.search_vector @@ plainto_tsquery('english', :query)
+            ORDER BY ts_rank(m.search_vector, plainto_tsquery('english', :query)) DESC
+            LIMIT :limit
+        """
 
